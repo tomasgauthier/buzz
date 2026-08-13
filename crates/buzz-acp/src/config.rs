@@ -111,6 +111,33 @@ impl std::fmt::Display for RespondTo {
     }
 }
 
+/// Turn-taking policy when a single event @mentions more than one same-owner
+/// agent at once, to avoid a redundant chorus of near-identical replies.
+///
+/// - `all` — every mentioned agent responds (default; no behavior change).
+/// - `first-mentioned` — only the first same-owner agent in the event's mention
+///   (`p`-tag) order responds; the others defer. Deterministic and computed
+///   independently by each agent from the event alone, so no cross-process
+///   coordination is needed. Trade-off: if the first-mentioned agent is offline,
+///   no one answers — so this is opt-in. Only applies in channels (never DMs),
+///   and only to agents that were themselves mentioned.
+#[derive(Debug, Clone, Copy, Default, PartialEq, clap::ValueEnum)]
+pub enum MultiMentionPolicy {
+    #[default]
+    All,
+    #[value(name = "first-mentioned")]
+    FirstMentioned,
+}
+
+impl std::fmt::Display for MultiMentionPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::All => f.write_str("all"),
+            Self::FirstMentioned => f.write_str("first-mentioned"),
+        }
+    }
+}
+
 /// Permission mode for agents that support `session/set_config_option` with
 /// `configId: "mode"` (e.g. `claude-agent-acp`).
 ///
@@ -381,6 +408,22 @@ pub struct CliArgs {
           value_parser = clap::value_parser!(u32))]
     pub max_agent_reply_chain: u32,
 
+    /// Maximum consecutive proactive heartbeat turns this agent fires without an
+    /// intervening human message. Bounds heartbeat traffic into rooms with no
+    /// human engagement; a human/owner/external message resets the counter.
+    /// 0 = disabled (default) so autonomous heartbeat-driven agents are
+    /// unaffected.
+    #[arg(long, env = "BUZZ_ACP_MAX_CONSECUTIVE_HEARTBEATS", default_value_t = 0,
+          value_parser = clap::value_parser!(u32))]
+    pub max_consecutive_heartbeats: u32,
+
+    /// Turn-taking policy when one event @mentions multiple same-owner agents.
+    /// `all` (default) = every mentioned agent responds; `first-mentioned` =
+    /// only the first-mentioned same-owner agent responds, the rest defer.
+    #[arg(long, env = "BUZZ_ACP_MULTI_MENTION_POLICY", value_enum,
+          default_value_t = MultiMentionPolicy::All)]
+    pub multi_mention_policy: MultiMentionPolicy,
+
     /// Disable automatic presence (online/offline) status.
     #[arg(long, env = "BUZZ_ACP_NO_PRESENCE")]
     pub no_presence: bool,
@@ -543,6 +586,11 @@ pub struct Config {
     /// before this agent stops auto-responding until a human speaks. 0 =
     /// disabled. See the CLI arg of the same name for the full contract.
     pub max_agent_reply_chain: u32,
+    /// Maximum consecutive proactive heartbeats without an intervening human
+    /// message. 0 = disabled. See the CLI arg of the same name.
+    pub max_consecutive_heartbeats: u32,
+    /// Turn-taking policy for events that mention multiple same-owner agents.
+    pub multi_mention_policy: MultiMentionPolicy,
     pub presence_enabled: bool,
     pub typing_enabled: bool,
     /// Whether NIP-AE agent core memory injection is enabled. When false,
@@ -1114,6 +1162,8 @@ impl Config {
             context_message_limit: args.context_message_limit,
             max_turns_per_session: args.max_turns_per_session,
             max_agent_reply_chain: args.max_agent_reply_chain,
+            max_consecutive_heartbeats: args.max_consecutive_heartbeats,
+            multi_mention_policy: args.multi_mention_policy,
             presence_enabled: !args.no_presence,
             typing_enabled: !args.no_typing,
             memory_enabled: args.memory && !args.no_memory,
@@ -1156,7 +1206,7 @@ impl Config {
             format!(" allowed_respond_to=[{}]", modes.join(","))
         };
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} max_agent_reply_chain={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
+            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} max_agent_reply_chain={} max_consecutive_heartbeats={} multi_mention_policy={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
             self.relay_url,
             self.keys.public_key().to_hex(),
             self.agent_command,
@@ -1173,6 +1223,8 @@ impl Config {
             self.context_message_limit,
             self.max_turns_per_session,
             self.max_agent_reply_chain,
+            self.max_consecutive_heartbeats,
+            self.multi_mention_policy,
             self.presence_enabled,
             self.typing_enabled,
             self.memory_enabled,
@@ -1491,6 +1543,8 @@ mod tests {
             context_message_limit: 12,
             max_turns_per_session: 0,
             max_agent_reply_chain: 8,
+            max_consecutive_heartbeats: 0,
+            multi_mention_policy: MultiMentionPolicy::All,
             presence_enabled: true,
             typing_enabled: true,
             memory_enabled: true,

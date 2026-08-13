@@ -2717,54 +2717,123 @@ async fn tokio_main() -> Result<()> {
                                 }
                             };
 
-                            // Agent↔agent loop guard. The event passed the
-                            // author gate and matched a rule, so it *would*
-                            // fire a turn. If it was authored by a same-owner
-                            // sibling agent, count it against this
-                            // conversation's reply chain; once the chain
-                            // exceeds `max_agent_reply_chain`, suppress the turn
-                            // until a human speaks again (which resets the
-                            // chain). A human/owner/external author always
-                            // resets and is never suppressed. The classification
-                            // reuses the sibling cache warmed by the author gate
-                            // above, so this is a cheap cached lookup on the hot
-                            // path (a REST profile fetch only for a brand-new
-                            // author under `anyone`/`allowlist` modes). Skipped
-                            // entirely when the guard is disabled so the async
-                            // sibling classification never runs.
-                            if config.max_agent_reply_chain > 0 {
+                            // Multi-agent safety gates. The event passed the
+                            // author gate and matched a rule, so it *would* fire
+                            // a turn. Three opt-in guards may still suppress it:
+                            //   1. heartbeat budget reset on human activity,
+                            //   2. multi-mention turn-taking (#4), and
+                            //   3. the agent↔agent reply-chain loop guard (#1).
+                            // The whole block is skipped when all three are off,
+                            // so the async sibling classification never runs on
+                            // the default hot path.
+                            let multi_agent_guards_active = config.max_agent_reply_chain > 0
+                                || config.max_consecutive_heartbeats > 0
+                                || config.multi_mention_policy
+                                    != config::MultiMentionPolicy::All;
+                            if multi_agent_guards_active {
                                 let author = buzz_event.event.pubkey.to_hex();
-                                let is_human_owner =
-                                    owner_cache.get() == Some(author.as_str());
-                                let author_is_agent = !is_human_owner
-                                    && is_owner_or_sibling(
-                                        &author,
-                                        &owner_cache,
-                                        &ctx.rest_client,
-                                    )
-                                    .await;
-                                let thread_tags =
-                                    queue::parse_thread_tags(&buzz_event.event);
-                                let key = loop_guard::LoopGuard::conversation_key(
-                                    buzz_event.channel_id,
-                                    thread_tags.root_event_id.as_deref(),
-                                );
-                                if let loop_guard::LoopDecision::Suppress { chain } =
-                                    loop_guard.evaluate(
-                                        &key,
-                                        author_is_agent,
-                                        config.max_agent_reply_chain,
-                                    )
+                                let thread_tags = queue::parse_thread_tags(&buzz_event.event);
+
+                                // Classify the author (owner/external human vs
+                                // same-owner sibling agent) only when a guard
+                                // needs it. A human turn resets the proactive
+                                // heartbeat budget. Reuses the sibling cache the
+                                // author gate warmed above, so this is a cached
+                                // lookup on the hot path (a REST profile fetch
+                                // only for a brand-new author under
+                                // `anyone`/`allowlist` modes).
+                                let author_is_agent = if config.max_agent_reply_chain > 0
+                                    || config.max_consecutive_heartbeats > 0
                                 {
-                                    tracing::warn!(
-                                        channel_id = %buzz_event.channel_id,
-                                        author = %author,
-                                        chain,
-                                        max = config.max_agent_reply_chain,
-                                        "agent-to-agent reply chain exceeded; suppressing \
-                                         turn until a human participates"
+                                    let is_human_owner =
+                                        owner_cache.get() == Some(author.as_str());
+                                    let is_agent = !is_human_owner
+                                        && is_owner_or_sibling(
+                                            &author,
+                                            &owner_cache,
+                                            &ctx.rest_client,
+                                        )
+                                        .await;
+                                    if !is_agent {
+                                        // Human re-engaged — let heartbeats resume.
+                                        loop_guard.note_human_activity();
+                                    }
+                                    is_agent
+                                } else {
+                                    false
+                                };
+
+                                // #4 — turn-taking. When one event @mentions
+                                // multiple same-owner agents, only the
+                                // first-mentioned one responds; the rest defer.
+                                // Channels only (a DM is 1:1 with a human), and
+                                // only when THIS agent was itself mentioned.
+                                // Deferring here means we never count this event
+                                // against our reply chain below.
+                                if config.multi_mention_policy
+                                    == config::MultiMentionPolicy::FirstMentioned
+                                    && !is_dm_channel(buzz_event.channel_id, &ctx.channel_info)
+                                        .await
+                                {
+                                    let owner = owner_cache.get();
+                                    let mut first_agent: Option<&str> = None;
+                                    let mut self_mentioned = false;
+                                    for pk in &thread_tags.mentioned_pubkeys {
+                                        let is_agent = if *pk == pubkey_hex {
+                                            self_mentioned = true;
+                                            true
+                                        } else if Some(pk.as_str()) == owner {
+                                            false // human owner mention
+                                        } else {
+                                            is_owner_or_sibling(
+                                                pk,
+                                                &owner_cache,
+                                                &ctx.rest_client,
+                                            )
+                                            .await
+                                        };
+                                        if is_agent && first_agent.is_none() {
+                                            first_agent = Some(pk.as_str());
+                                        }
+                                    }
+                                    if self_mentioned {
+                                        if let Some(first) = first_agent {
+                                            if first != pubkey_hex.as_str() {
+                                                tracing::info!(
+                                                    channel_id = %buzz_event.channel_id,
+                                                    first_mentioned = %first,
+                                                    "multiple agents mentioned; deferring \
+                                                     to first-mentioned agent"
+                                                );
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // #1 — agent↔agent reply-chain loop guard.
+                                if config.max_agent_reply_chain > 0 {
+                                    let key = loop_guard::LoopGuard::conversation_key(
+                                        buzz_event.channel_id,
+                                        thread_tags.root_event_id.as_deref(),
                                     );
-                                    continue;
+                                    if let loop_guard::LoopDecision::Suppress { chain } = loop_guard
+                                        .evaluate(
+                                            &key,
+                                            author_is_agent,
+                                            config.max_agent_reply_chain,
+                                        )
+                                    {
+                                        tracing::warn!(
+                                            channel_id = %buzz_event.channel_id,
+                                            author = %author,
+                                            chain,
+                                            max = config.max_agent_reply_chain,
+                                            "agent-to-agent reply chain exceeded; suppressing \
+                                             turn until a human participates"
+                                        );
+                                        continue;
+                                    }
                                 }
                             }
                             // Capture author pubkey before queue.push() moves
@@ -2952,7 +3021,19 @@ async fn tokio_main() -> Result<()> {
                             typing_channels.insert(channel_id, thread_tags);
                         }
                     } else if pool.any_idle() {
-                        dispatch_heartbeat(&mut pool, &ctx, &mut heartbeat_in_flight);
+                        // Heartbeats are proactive agent traffic with no
+                        // triggering message. Bound how many fire without a
+                        // human in the loop so an agent can't self-prompt
+                        // indefinitely into a room with no human engagement.
+                        // Disabled by default (0) so autonomous heartbeat-driven
+                        // agents are unaffected.
+                        if config.max_consecutive_heartbeats > 0
+                            && !loop_guard.allow_heartbeat(config.max_consecutive_heartbeats)
+                        {
+                            tracing::debug!("heartbeat_skipped_no_human_engagement");
+                        } else {
+                            dispatch_heartbeat(&mut pool, &ctx, &mut heartbeat_in_flight);
+                        }
                     } else {
                         tracing::debug!("heartbeat_skipped_busy");
                     }
@@ -6575,6 +6656,8 @@ mod build_mcp_servers_tests {
             context_message_limit: 12,
             max_turns_per_session: 0,
             max_agent_reply_chain: 8,
+            max_consecutive_heartbeats: 0,
+            multi_mention_policy: config::MultiMentionPolicy::All,
             presence_enabled: true,
             typing_enabled: true,
             memory_enabled: false,
@@ -6799,6 +6882,8 @@ mod error_outcome_emission_tests {
             context_message_limit: 12,
             max_turns_per_session: 0,
             max_agent_reply_chain: 8,
+            max_consecutive_heartbeats: 0,
+            multi_mention_policy: config::MultiMentionPolicy::All,
             presence_enabled: true,
             typing_enabled: true,
             memory_enabled: false,

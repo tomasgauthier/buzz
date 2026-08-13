@@ -20,6 +20,7 @@
 //! ping-pong is broken from both ends once either side hits the ceiling.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
 use uuid::Uuid;
@@ -40,16 +41,47 @@ pub(crate) enum LoopDecision {
     Suppress { chain: u32 },
 }
 
-/// Per-conversation counter of consecutive sibling-authored turns.
+/// Per-conversation counter of consecutive sibling-authored turns, plus a
+/// global counter of consecutive proactive heartbeats since the last human
+/// message.
 pub(crate) struct LoopGuard {
     counts: Mutex<HashMap<String, u32>>,
+    /// Consecutive heartbeat turns fired with no intervening human message.
+    /// Reset by [`LoopGuard::note_human_activity`].
+    heartbeats_since_human: AtomicU32,
 }
 
 impl LoopGuard {
     pub(crate) fn new() -> Self {
         Self {
             counts: Mutex::new(HashMap::new()),
+            heartbeats_since_human: AtomicU32::new(0),
         }
+    }
+
+    /// Record that a human (owner/allowlisted/external) event was processed.
+    ///
+    /// Resets the proactive-heartbeat budget so heartbeats can resume after a
+    /// human re-engages. Per-conversation reply chains are reset separately by
+    /// [`LoopGuard::evaluate`] (they key on the specific conversation).
+    pub(crate) fn note_human_activity(&self) {
+        self.heartbeats_since_human.store(0, Ordering::Relaxed);
+    }
+
+    /// Decide whether a proactive heartbeat may fire, counting it against the
+    /// consecutive-heartbeats-without-a-human budget.
+    ///
+    /// `max` is the ceiling; `0` disables the guard (always `true`). The first
+    /// `max` heartbeats after a human message are allowed; beyond that,
+    /// heartbeats are suppressed until [`LoopGuard::note_human_activity`] runs.
+    pub(crate) fn allow_heartbeat(&self, max: u32) -> bool {
+        if max == 0 {
+            return true;
+        }
+        // fetch_add returns the prior value; the count *after* this heartbeat is
+        // prior + 1. Allow while that is within the ceiling.
+        let prior = self.heartbeats_since_human.fetch_add(1, Ordering::Relaxed);
+        prior < max
     }
 
     /// Conversation key for `(channel, thread)`.
@@ -188,5 +220,54 @@ mod tests {
         let top_b = LoopGuard::conversation_key(chan(), None);
         assert_eq!(top_a, top_b);
         assert_ne!(with_root, top_a);
+    }
+
+    #[test]
+    fn heartbeat_guard_disabled_when_max_is_zero() {
+        let g = LoopGuard::new();
+        for _ in 0..1000 {
+            assert!(g.allow_heartbeat(0));
+        }
+    }
+
+    #[test]
+    fn heartbeat_allows_up_to_ceiling_then_suppresses() {
+        let g = LoopGuard::new();
+        // First `max` heartbeats fire.
+        assert!(g.allow_heartbeat(3));
+        assert!(g.allow_heartbeat(3));
+        assert!(g.allow_heartbeat(3));
+        // Beyond the ceiling, suppressed.
+        assert!(!g.allow_heartbeat(3));
+        assert!(!g.allow_heartbeat(3));
+    }
+
+    #[test]
+    fn human_activity_resets_heartbeat_budget() {
+        let g = LoopGuard::new();
+        assert!(g.allow_heartbeat(2));
+        assert!(g.allow_heartbeat(2));
+        assert!(!g.allow_heartbeat(2));
+        // A human re-engages — budget resets.
+        g.note_human_activity();
+        assert!(g.allow_heartbeat(2));
+        assert!(g.allow_heartbeat(2));
+        assert!(!g.allow_heartbeat(2));
+    }
+
+    #[test]
+    fn note_human_activity_does_not_disturb_reply_chains() {
+        let g = LoopGuard::new();
+        let key = LoopGuard::conversation_key(chan(), Some("root"));
+        for _ in 0..3 {
+            g.evaluate(&key, true, 3);
+        }
+        // Resetting the heartbeat budget must not reset the per-conversation
+        // reply chain.
+        g.note_human_activity();
+        assert!(matches!(
+            g.evaluate(&key, true, 3),
+            LoopDecision::Suppress { .. }
+        ));
     }
 }
