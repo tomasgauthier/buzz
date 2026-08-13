@@ -373,6 +373,14 @@ pub struct CliArgs {
           value_parser = clap::value_parser!(u32))]
     pub max_turns_per_session: u32,
 
+    /// Maximum consecutive agent-to-agent (same-owner sibling) replies allowed
+    /// in one conversation before this agent stops auto-responding until a
+    /// human speaks again. Guards against unbounded agent↔agent reply loops.
+    /// A human/owner/allowlisted message resets the counter. 0 = disabled.
+    #[arg(long, env = "BUZZ_ACP_MAX_AGENT_REPLY_CHAIN", default_value_t = 8,
+          value_parser = clap::value_parser!(u32))]
+    pub max_agent_reply_chain: u32,
+
     /// Disable automatic presence (online/offline) status.
     #[arg(long, env = "BUZZ_ACP_NO_PRESENCE")]
     pub no_presence: bool,
@@ -531,6 +539,10 @@ pub struct Config {
     pub context_message_limit: u32,
     /// Maximum turns per session before proactive rotation. 0 = disabled.
     pub max_turns_per_session: u32,
+    /// Maximum consecutive same-owner-sibling replies in one conversation
+    /// before this agent stops auto-responding until a human speaks. 0 =
+    /// disabled. See the CLI arg of the same name for the full contract.
+    pub max_agent_reply_chain: u32,
     pub presence_enabled: bool,
     pub typing_enabled: bool,
     /// Whether NIP-AE agent core memory injection is enabled. When false,
@@ -1101,6 +1113,7 @@ impl Config {
             config_path: args.config,
             context_message_limit: args.context_message_limit,
             max_turns_per_session: args.max_turns_per_session,
+            max_agent_reply_chain: args.max_agent_reply_chain,
             presence_enabled: !args.no_presence,
             typing_enabled: !args.no_typing,
             memory_enabled: args.memory && !args.no_memory,
@@ -1143,7 +1156,7 @@ impl Config {
             format!(" allowed_respond_to=[{}]", modes.join(","))
         };
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
+            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} max_agent_reply_chain={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
             self.relay_url,
             self.keys.public_key().to_hex(),
             self.agent_command,
@@ -1159,6 +1172,7 @@ impl Config {
             self.ignore_self,
             self.context_message_limit,
             self.max_turns_per_session,
+            self.max_agent_reply_chain,
             self.presence_enabled,
             self.typing_enabled,
             self.memory_enabled,
@@ -1476,6 +1490,7 @@ mod tests {
             config_path: PathBuf::from("./buzz-acp.toml"),
             context_message_limit: 12,
             max_turns_per_session: 0,
+            max_agent_reply_chain: 8,
             presence_enabled: true,
             typing_enabled: true,
             memory_enabled: true,

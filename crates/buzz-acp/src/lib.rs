@@ -4,6 +4,7 @@ mod acp;
 mod config;
 mod engram_fetch;
 mod filter;
+mod loop_guard;
 mod observer;
 mod pool;
 mod pool_lifecycle;
@@ -1873,6 +1874,8 @@ async fn tokio_main() -> Result<()> {
         }
     }
     let owner_cache = OwnerCache::new(startup_owner.clone());
+    // Bounds unbounded agent↔agent reply chains (see `loop_guard`).
+    let loop_guard = loop_guard::LoopGuard::new();
 
     let mut relay_observer_control_rx = None;
     let mut relay_observer_publisher_task = None;
@@ -2713,6 +2716,57 @@ async fn tokio_main() -> Result<()> {
                                     continue;
                                 }
                             };
+
+                            // Agent↔agent loop guard. The event passed the
+                            // author gate and matched a rule, so it *would*
+                            // fire a turn. If it was authored by a same-owner
+                            // sibling agent, count it against this
+                            // conversation's reply chain; once the chain
+                            // exceeds `max_agent_reply_chain`, suppress the turn
+                            // until a human speaks again (which resets the
+                            // chain). A human/owner/external author always
+                            // resets and is never suppressed. The classification
+                            // reuses the sibling cache warmed by the author gate
+                            // above, so this is a cheap cached lookup on the hot
+                            // path (a REST profile fetch only for a brand-new
+                            // author under `anyone`/`allowlist` modes). Skipped
+                            // entirely when the guard is disabled so the async
+                            // sibling classification never runs.
+                            if config.max_agent_reply_chain > 0 {
+                                let author = buzz_event.event.pubkey.to_hex();
+                                let is_human_owner =
+                                    owner_cache.get() == Some(author.as_str());
+                                let author_is_agent = !is_human_owner
+                                    && is_owner_or_sibling(
+                                        &author,
+                                        &owner_cache,
+                                        &ctx.rest_client,
+                                    )
+                                    .await;
+                                let thread_tags =
+                                    queue::parse_thread_tags(&buzz_event.event);
+                                let key = loop_guard::LoopGuard::conversation_key(
+                                    buzz_event.channel_id,
+                                    thread_tags.root_event_id.as_deref(),
+                                );
+                                if let loop_guard::LoopDecision::Suppress { chain } =
+                                    loop_guard.evaluate(
+                                        &key,
+                                        author_is_agent,
+                                        config.max_agent_reply_chain,
+                                    )
+                                {
+                                    tracing::warn!(
+                                        channel_id = %buzz_event.channel_id,
+                                        author = %author,
+                                        chain,
+                                        max = config.max_agent_reply_chain,
+                                        "agent-to-agent reply chain exceeded; suppressing \
+                                         turn until a human participates"
+                                    );
+                                    continue;
+                                }
+                            }
                             // Capture author pubkey before queue.push() moves
                             // buzz_event.event (needed for mode gate below).
                             let author_hex = buzz_event.event.pubkey.to_hex();
@@ -6520,6 +6574,7 @@ mod build_mcp_servers_tests {
             config_path: std::path::PathBuf::from("./buzz-acp.toml"),
             context_message_limit: 12,
             max_turns_per_session: 0,
+            max_agent_reply_chain: 8,
             presence_enabled: true,
             typing_enabled: true,
             memory_enabled: false,
@@ -6743,6 +6798,7 @@ mod error_outcome_emission_tests {
             config_path: std::path::PathBuf::from("./buzz-acp.toml"),
             context_message_limit: 12,
             max_turns_per_session: 0,
+            max_agent_reply_chain: 8,
             presence_enabled: true,
             typing_enabled: true,
             memory_enabled: false,
