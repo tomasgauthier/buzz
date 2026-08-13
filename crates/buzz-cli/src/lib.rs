@@ -90,8 +90,13 @@ struct Cli {
     #[arg(long, env = "BUZZ_AUTH_TAG", hide_env_values = true)]
     auth_tag: Option<String>,
 
-    /// Output format: 'json' (default, full fields) or 'compact' (reduced fields).
-    #[arg(long, value_enum, default_value = "json")]
+    /// Output format: 'json' (default, full fields), 'agent' (author +
+    /// reply link + readable time, no raw tags), or 'compact' (id/content/time).
+    ///
+    /// Declared `global` so it is accepted both before the subcommand
+    /// (`buzz --format agent messages get …`) and after it
+    /// (`buzz messages get … --format agent`).
+    #[arg(long, value_enum, default_value = "json", global = true)]
     format: OutputFormat,
 
     #[command(subcommand)]
@@ -167,7 +172,14 @@ pub enum OutputFormat {
     #[default]
     #[value(name = "json")]
     Json,
-    /// Reduced fields for agent scanning
+    /// Discussion-oriented view: keeps author (`pubkey`), `kind`, `content`,
+    /// a readable `time`, and the `reply_to` link, but drops the raw `tags`
+    /// array. Cheaper than `json` while preserving who-said-what and thread
+    /// structure — the fields an agent needs to follow and join a conversation.
+    #[value(name = "agent")]
+    Agent,
+    /// Minimal fields (`id`, `content`, `created_at`) for cheap scanning.
+    /// Drops author and thread links — use `agent` when attribution matters.
     #[value(name = "compact")]
     Compact,
 }

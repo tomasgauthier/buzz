@@ -93,7 +93,9 @@ pub async fn cmd_list_channels(
         .map(extract_channel_metadata)
         .collect();
     let output = match format {
-        crate::OutputFormat::Compact => {
+        // Channels have no thread structure, so `agent` reduces to the same
+        // scan-friendly shape as `compact`.
+        crate::OutputFormat::Agent | crate::OutputFormat::Compact => {
             let compact: Vec<serde_json::Value> = channels
                 .iter()
                 .map(|c| {

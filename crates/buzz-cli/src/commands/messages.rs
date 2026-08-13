@@ -329,8 +329,79 @@ fn parse_member_pubkeys(event: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
-fn format_events(normalized: &str, format: &crate::OutputFormat) -> String {
+/// Extract the event this message is replying to, for the `agent` format.
+///
+/// Prefers the NIP-10 `reply` marker (the immediate parent) and falls back to
+/// the `root` marker, so a nested reply shows its direct parent while a
+/// top-level reply shows the thread root. Returns `None` for a message with no
+/// thread markers (a top-level post).
+fn find_reply_target_from_tags(tags: &serde_json::Value) -> Option<String> {
+    fn valid_event_id(s: &str) -> bool {
+        s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
+    }
+    let arr = tags.as_array()?;
+    let mut root = None;
+    let mut reply = None;
+    for tag in arr {
+        let Some(parts) = tag.as_array() else {
+            continue;
+        };
+        if parts.len() >= 4 && parts[0].as_str() == Some("e") {
+            let id = parts[1].as_str().filter(|s| valid_event_id(s));
+            match (parts[3].as_str(), id) {
+                (Some("root"), Some(id)) => root = Some(id.to_string()),
+                (Some("reply"), Some(id)) => reply = Some(id.to_string()),
+                _ => {}
+            }
+        }
+    }
+    reply.or(root)
+}
+
+/// Render a Unix timestamp as a human- and agent-readable RFC 3339 UTC string.
+///
+/// Falls back to the raw seconds (as a string) if the value is out of range,
+/// so the field is always present and never silently dropped.
+fn unix_to_iso(secs: u64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(secs as i64, 0)
+        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_else(|| secs.to_string())
+}
+
+/// Render a normalized event array (`normalize_events` output) in the given
+/// [`OutputFormat`]. Shared by message, thread, and feed reads so the `agent`
+/// and `compact` shapes stay identical across event-listing commands.
+pub(crate) fn format_events(normalized: &str, format: &crate::OutputFormat) -> String {
     match format {
+        crate::OutputFormat::Agent => {
+            let events: Vec<serde_json::Value> =
+                serde_json::from_str(normalized).unwrap_or_default();
+            let rendered: Vec<serde_json::Value> = events
+                .iter()
+                .map(|e| {
+                    let created_at = e.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let mut obj = serde_json::Map::new();
+                    obj.insert("id".into(), e.get("id").cloned().unwrap_or_default());
+                    obj.insert(
+                        "pubkey".into(),
+                        e.get("pubkey").cloned().unwrap_or_default(),
+                    );
+                    obj.insert("kind".into(), e.get("kind").cloned().unwrap_or_default());
+                    obj.insert(
+                        "content".into(),
+                        e.get("content").cloned().unwrap_or_default(),
+                    );
+                    obj.insert("time".into(), serde_json::json!(unix_to_iso(created_at)));
+                    if let Some(tags) = e.get("tags") {
+                        if let Some(reply_to) = find_reply_target_from_tags(tags) {
+                            obj.insert("reply_to".into(), serde_json::json!(reply_to));
+                        }
+                    }
+                    serde_json::Value::Object(obj)
+                })
+                .collect();
+            serde_json::to_string(&rendered).unwrap_or_default()
+        }
         crate::OutputFormat::Compact => {
             let events: Vec<serde_json::Value> =
                 serde_json::from_str(normalized).unwrap_or_default();
@@ -993,10 +1064,11 @@ pub async fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::{
-        event_mention_pubkeys, find_root_from_tags, match_profiles_by_name, merge_message_mentions,
-        missing_members, normalize_explicit_mentions, parse_member_pubkeys,
-        resolve_names_to_pubkeys,
+        event_mention_pubkeys, find_reply_target_from_tags, find_root_from_tags, format_events,
+        match_profiles_by_name, merge_message_mentions, missing_members,
+        normalize_explicit_mentions, parse_member_pubkeys, resolve_names_to_pubkeys, unix_to_iso,
     };
+    use crate::OutputFormat;
     use buzz_sdk::mentions::{
         extract_at_mentions_with_known, extract_at_names, match_names_to_profiles, MentionProfile,
     };
@@ -1371,5 +1443,78 @@ mod tests {
             profile_event(PK_VALID_A, Some("Aaron"), None),
         ];
         assert_eq!(match_profiles_by_name(&events, "Aaron").len(), 1);
+    }
+
+    #[test]
+    fn reply_target_prefers_reply_marker_over_root() {
+        // A nested reply carries both markers; `agent` format shows the
+        // immediate parent (reply), not the thread root.
+        let tags = json!([["e", ID_A, "", "root"], ["e", ID_B, "", "reply"]]);
+        assert_eq!(find_reply_target_from_tags(&tags).as_deref(), Some(ID_B));
+    }
+
+    #[test]
+    fn reply_target_falls_back_to_root_and_none() {
+        // Only a root marker → that's the reply target.
+        let root_only = json!([["e", ID_A, "", "root"]]);
+        assert_eq!(
+            find_reply_target_from_tags(&root_only).as_deref(),
+            Some(ID_A)
+        );
+        // Top-level post with no e-markers → no reply link.
+        let top_level = json!([["p", PUBKEY]]);
+        assert!(find_reply_target_from_tags(&top_level).is_none());
+    }
+
+    #[test]
+    fn unix_to_iso_renders_rfc3339_utc() {
+        assert_eq!(unix_to_iso(1_636_927_200), "2021-11-14T22:00:00Z");
+    }
+
+    #[test]
+    fn agent_format_keeps_author_and_reply_drops_raw_tags() {
+        let normalized = serde_json::to_string(&json!([{
+            "id": ID_A,
+            "pubkey": PUBKEY,
+            "kind": 9,
+            "content": "hello",
+            "created_at": 1_636_927_200u64,
+            "tags": [["h", "chan"], ["e", ID_B, "", "reply"], ["p", PK_VALID_A]],
+        }]))
+        .unwrap();
+
+        let out = format_events(&normalized, &OutputFormat::Agent);
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let ev = &parsed[0];
+
+        // Author identity is preserved (the field `compact` drops).
+        assert_eq!(ev.get("pubkey").and_then(|v| v.as_str()), Some(PUBKEY));
+        assert_eq!(ev.get("kind").and_then(|v| v.as_u64()), Some(9));
+        // Thread link is surfaced without the raw tags array.
+        assert_eq!(ev.get("reply_to").and_then(|v| v.as_str()), Some(ID_B));
+        assert!(ev.get("tags").is_none());
+        // Timestamp is readable, and the raw epoch field is gone.
+        assert_eq!(
+            ev.get("time").and_then(|v| v.as_str()),
+            Some("2021-11-14T22:00:00Z")
+        );
+        assert!(ev.get("created_at").is_none());
+    }
+
+    #[test]
+    fn agent_format_omits_reply_to_for_top_level() {
+        let normalized = serde_json::to_string(&json!([{
+            "id": ID_A,
+            "pubkey": PUBKEY,
+            "kind": 9,
+            "content": "top-level",
+            "created_at": 1_636_927_200u64,
+            "tags": [["h", "chan"]],
+        }]))
+        .unwrap();
+
+        let out = format_events(&normalized, &OutputFormat::Agent);
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(parsed[0].get("reply_to").is_none());
     }
 }

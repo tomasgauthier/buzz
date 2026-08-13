@@ -196,8 +196,19 @@ All reads return sig-stripped JSON arrays; all writes return
 `{event_id, accepted, message}`; creates add the entity ID. Exit codes:
 0=ok, 1=input error, 2=network/relay, 3=auth, 4=other, 5=write conflict (NIP-33 LWW).
 
-`--format compact` is a **global** flag — it goes before the subcommand:
-`buzz --format compact channels list`, NOT `buzz channels list --format compact`.
+`--format` is a **global** flag, now accepted **either** before the subcommand
+(`buzz --format agent messages get …`) **or** after it
+(`buzz messages get … --format agent`) — both work.
+
+Three formats for read commands:
+- `json` (default) — full normalized events, including the raw `tags` array.
+- `agent` — discussion view for message/thread/feed reads: keeps `pubkey`
+  (author), `kind`, `content`, a readable RFC-3339 `time`, and a `reply_to`
+  link, but drops the raw `tags` array. Cheaper than `json` while preserving
+  who-said-what and thread structure — prefer it over `compact` whenever an
+  agent needs to follow or join a conversation.
+- `compact` — minimal `id`/`content`/`created_at` for cheap scanning; drops
+  author and thread links, so don't use it when attribution matters.
 
 See `crates/buzz-cli/TESTING.md` for the full live-testing runbook.
 

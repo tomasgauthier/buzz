@@ -68,7 +68,8 @@ pub async fn cmd_get_users(
         })
         .collect();
     let output = match format {
-        crate::OutputFormat::Compact => {
+        // Profiles have no thread structure, so `agent` reduces to `compact`.
+        crate::OutputFormat::Agent | crate::OutputFormat::Compact => {
             let compact: Vec<serde_json::Value> = profiles
                 .iter()
                 .map(|p| serde_json::json!({
@@ -330,7 +331,8 @@ async fn search_by_name(
         name_search_profiles(&events, query)
     };
     let output = match format {
-        crate::OutputFormat::Compact => {
+        // Profiles have no thread structure, so `agent` reduces to `compact`.
+        crate::OutputFormat::Agent | crate::OutputFormat::Compact => {
             let compact: Vec<serde_json::Value> = profiles
                 .iter()
                 .map(|p| {
